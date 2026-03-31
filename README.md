@@ -5,6 +5,8 @@ Base inicial do projeto da disciplina voltado para um dashboard mobile-first/PWA
 ## Documentacao inicial
 
 - [Mapeamento de dados da API e proposta de negocio](./docs/api-dados-negocio.md)
+- [Mapeamento frontend: telas, dados e derivacoes](./docs/frontend-mapeamento-dados.md)
+- [Como rodar o frontend integrado](./docs/como-rodar-frontend.md)
 
 ## Observacao importante
 

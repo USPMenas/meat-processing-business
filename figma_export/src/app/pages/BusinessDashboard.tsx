@@ -1,129 +1,124 @@
-import { DashboardLayout } from "../components/layout/DashboardLayout";
-import { MetricCardWithChart } from "../components/dashboard/MetricCardWithChart";
 import {
-  BarChart,
   Bar,
+  CartesianGrid,
+  ComposedChart,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
   XAxis,
   YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  ResponsiveContainer,
-  LineChart,
-  Line,
-  ComposedChart,
-  Area,
-  AreaChart,
 } from "recharts";
 import {
   DollarSign,
+  Target,
   TrendingUp,
   Zap,
-  Target,
 } from "lucide-react";
+import { ApiRefreshNotice } from "../components/dashboard/ApiRefreshNotice";
+import { MetricCardWithChart } from "../components/dashboard/MetricCardWithChart";
+import { DashboardLayout } from "../components/layout/DashboardLayout";
+import { useDashboardAutoRefresh } from "../hooks/useDashboardAutoRefresh";
 import {
-  getMonthlyComparison,
-  getCurrentMonthData,
-  generateHistoricalData,
-} from "../utils/mockData";
+  getBusinessDashboardData,
+  getBusinessProjection,
+  getBusinessVariation,
+  toBusinessHourlyPattern,
+} from "../services/dashboardData";
 
 export default function BusinessDashboard() {
-  const monthlyComparison = getMonthlyComparison();
-  const currentMonthData = getCurrentMonthData();
-  const historicalData = generateHistoricalData();
+  const {
+    data: dashboardData,
+    error,
+    isInitialLoading,
+    isRefreshing,
+    lastFetchedAt,
+    showRefreshNotice,
+  } = useDashboardAutoRefresh({
+    errorMessage: "Falha ao carregar os dados de negocios.",
+    loader: getBusinessDashboardData,
+    scope: "business",
+  });
 
-  // Cálculos financeiros
-  const currentMonth =
-    monthlyComparison[monthlyComparison.length - 1];
-  const previousMonth =
-    monthlyComparison[monthlyComparison.length - 2];
+  if (!dashboardData && error) {
+    return (
+      <DashboardLayout variant="business">
+        <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+          {error}
+        </div>
+      </DashboardLayout>
+    );
+  }
 
-  const energyCostChange =
-    ((currentMonth.energyCost - previousMonth.energyCost) /
-      previousMonth.energyCost) *
-    100;
-  const revenueChange =
-    ((currentMonth.revenue - previousMonth.revenue) /
-      previousMonth.revenue) *
-    100;
+  if (!dashboardData && isInitialLoading) {
+    return (
+      <DashboardLayout variant="business">
+        <div className="rounded-xl border border-blue-200 bg-white p-4 text-sm text-gray-600">
+          Carregando dados de negocios...
+        </div>
+      </DashboardLayout>
+    );
+  }
 
-  const projectedRevenue =
-    (currentMonth.revenue / currentMonthData.length) * 31;
-  const projectedEnergyCost =
-    (currentMonth.energyCost / currentMonthData.length) * 31;
+  if (!dashboardData) {
+    return null;
+  }
 
-  const currentMargin =
-    ((currentMonth.revenue - currentMonth.energyCost) /
-      currentMonth.revenue) *
-    100;
-  const projectedMargin =
-    ((projectedRevenue - projectedEnergyCost) /
-      projectedRevenue) *
-    100;
-
-  // Dados acumulados do mês
-  const cumulativeData = currentMonthData.map((d, index) => ({
-    day: d.day,
-    energyAccum: currentMonthData
-      .slice(0, index + 1)
-      .reduce((acc, item) => acc + item.energy, 0),
-    revenueAccum: currentMonthData
-      .slice(0, index + 1)
-      .reduce((acc, item) => acc + item.revenue, 0),
+  const {
+    monthlyComparison,
+    currentMonthData,
+    historicalData,
+    currentMonth,
+    previousMonth,
+    currentMonthLabel,
+    currentDataDays,
+  } = dashboardData;
+  const {
+    energyCostChange,
+    revenueChange,
+  } = getBusinessVariation(currentMonth, previousMonth);
+  const {
+    projectedRevenue,
+    projectedEnergyCost,
+    currentMargin,
+    projectedMargin,
+  } = getBusinessProjection(currentMonth, currentDataDays);
+  const dailyChartData = currentMonthData.map((point) => ({
+    day: point.day,
+    energy: point.energy,
+    revenue: point.revenue / 100,
   }));
-
-  // Dados dos últimos 30 dias para histograma
-  const last30DaysData = currentMonthData.map((d) => ({
-    day: d.day,
-    energy: d.energy,
-    revenue: d.revenue / 100, // Divide por 100 para escala similar
-  }));
-
-  // Média diária por hora (últimas 24h)
-  const hourlyAverages = Array.from(
-    { length: 24 },
-    (_, hour) => {
-      const hourData = historicalData.filter(
-        (d) => d.timestamp.getHours() === hour,
-      );
-      if (hourData.length === 0) return null;
-
-      return {
-        hour,
-        avgEnergy:
-          hourData.reduce(
-            (acc, d) =>
-              acc + d.freezerEnergy + d.equipmentEnergy,
-            0,
-          ) / hourData.length,
-        avgOccupancy:
-          hourData.reduce((acc, d) => acc + d.occupancy, 0) /
-          hourData.length,
-      };
-    },
-  ).filter(Boolean);
-
-  // Mini gráficos
-  const recentMonthData = currentMonthData.slice(-12);
+  const hourlyAverages =
+    toBusinessHourlyPattern(historicalData);
+  const averageDailyCost =
+    currentDataDays > 0
+      ? currentMonth.energyCost / currentDataDays
+      : 0;
 
   return (
     <DashboardLayout variant="business">
       <div className="space-y-4">
-        {/* KPIs Executivos */}
+        {error && (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+            {error}
+          </div>
+        )}
+
         <div>
-          <h2 className="text-base font-semibold text-gray-900 mb-3">
-            Indicadores Financeiros - Março 2026
+          <h2 className="mb-3 text-base font-semibold text-gray-900">
+            Indicadores Financeiros - {currentMonthLabel}
           </h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-3">
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-3 lg:grid-cols-4">
             <MetricCardWithChart
               title="Faturamento Atual"
               value={`R$ ${(currentMonth.revenue / 1000).toFixed(0)}k`}
               icon={DollarSign}
               variant="business"
-              subtitle="Mês atual"
+              subtitle="Periodo com dados"
               footer={
                 <div className="text-xs text-blue-700">
-                  <strong>vs. mês anterior:</strong>{" "}
+                  <strong>vs. ultimo periodo com dados:</strong>{" "}
                   {revenueChange >= 0 ? "+" : ""}
                   {revenueChange.toFixed(1)}%
                 </div>
@@ -131,52 +126,47 @@ export default function BusinessDashboard() {
             />
 
             <MetricCardWithChart
-              title="Projeção Mensal"
+              title="Projecao Mensal"
               value={`R$ ${(projectedRevenue / 1000).toFixed(0)}k`}
               icon={TrendingUp}
               variant="business"
-              subtitle="Estimativa fim do mês"
+              subtitle="Estimativa fim do mes"
               footer={
                 <div className="text-xs text-blue-700">
-                  Baseado em {currentMonthData.length} dias de
-                  dados
+                  Baseado em {currentDataDays} dias com leitura
                 </div>
               }
             />
 
             <MetricCardWithChart
-              title="Custo Energético"
+              title="Custo Energetico"
               value={`R$ ${(currentMonth.energyCost / 1000).toFixed(0)}k`}
               icon={Zap}
               variant="business"
-              subtitle="Mês atual"
+              subtitle="Periodo atual"
               footer={
                 <div className="text-xs text-blue-700">
-                  <strong>Projeção mês:</strong> R${" "}
+                  <strong>Projecao mes:</strong> R${" "}
                   {(projectedEnergyCost / 1000).toFixed(0)}k
                 </div>
               }
             />
 
             <MetricCardWithChart
-              title="Projeção de Custo Mensal"
-              value={`R$ ${(projectedRevenue / 1000).toFixed(0)}k`}
+              title="Projecao de Custo Mensal"
+              value={`R$ ${(projectedEnergyCost / 1000).toFixed(0)}k`}
               icon={TrendingUp}
               variant="business"
-              subtitle="Estimativa fim do mês"
+              subtitle="Estimativa fim do mes"
               footer={
                 <div className="text-xs text-blue-700">
-                  Baseado em {currentMonthData.length} dias de
-                  dados
+                  Baseado em {currentDataDays} dias com leitura
                 </div>
               }
-              detailTitle="Comparação Mensal - Últimos 5 Meses"
+              detailTitle="Comparacao Mensal - Periodos Disponiveis na API"
               detailContent={
                 <div>
-                  <ResponsiveContainer
-                    width="100%"
-                    height={350}
-                  >
+                  <ResponsiveContainer width="100%" height={350}>
                     <ComposedChart data={monthlyComparison}>
                       <CartesianGrid
                         strokeDasharray="3 3"
@@ -234,23 +224,21 @@ export default function BusinessDashboard() {
               subtitle="Margem atual"
               footer={
                 <div className="text-xs text-blue-700">
-                  <strong>Projeção:</strong>{" "}
-                  {projectedMargin.toFixed(1)}% no fim do mês
+                  <strong>Projecao:</strong>{" "}
+                  {projectedMargin.toFixed(1)}% no fim do mes
                 </div>
               }
             />
           </div>
         </div>
 
-        {/* Gráficos Principais */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          {/* Gráfico de Linha - Últimos 30 Dias */}
-          <div className="bg-white rounded-xl border border-blue-100 shadow-sm p-5">
-            <h3 className="text-sm font-semibold text-gray-900 mb-4">
-              Custo Energético Diário - Últimos 30 Dias
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <div className="rounded-xl border border-blue-100 bg-white p-5 shadow-sm">
+            <h3 className="mb-4 text-sm font-semibold text-gray-900">
+              Custo Energetico Diario - Dias com Leitura
             </h3>
             <ResponsiveContainer width="100%" height={240}>
-              <LineChart data={last30DaysData}>
+              <LineChart data={dailyChartData}>
                 <CartesianGrid
                   strokeDasharray="3 3"
                   stroke="#e0e7ff"
@@ -258,7 +246,7 @@ export default function BusinessDashboard() {
                 <XAxis
                   dataKey="day"
                   label={{
-                    value: "Dia do Mês",
+                    value: "Dia do Mes",
                     position: "insideBottomLeft",
                     offset: -5,
                   }}
@@ -296,25 +284,19 @@ export default function BusinessDashboard() {
                 />
               </LineChart>
             </ResponsiveContainer>
-            <div className="mt-4 p-3 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-lg border border-blue-200">
+            <div className="mt-4 rounded-lg border border-blue-200 bg-gradient-to-r from-blue-50 to-indigo-50 p-3">
               <p className="text-xs text-blue-800">
-                <strong>Total do mês:</strong> R${" "}
-                {currentMonth.energyCost.toLocaleString(
-                  "pt-BR",
-                )}{" "}
-                |<strong> Média diária:</strong> R${" "}
-                {(
-                  currentMonth.energyCost /
-                  currentMonthData.length
-                ).toFixed(0)}
+                <strong>Total do periodo:</strong> R${" "}
+                {currentMonth.energyCost.toLocaleString("pt-BR")} |
+                <strong> Media diaria:</strong> R${" "}
+                {averageDailyCost.toFixed(0)}
               </p>
             </div>
           </div>
 
-          {/* Gráfico de Linha - Média Diária por Hora */}
-          <div className="bg-white rounded-xl border border-blue-100 shadow-sm p-5">
-            <h3 className="text-sm font-semibold text-gray-900 mb-4">
-              Padrão Diário: Consumo vs Ocupação
+          <div className="rounded-xl border border-blue-100 bg-white p-5 shadow-sm">
+            <h3 className="mb-4 text-sm font-semibold text-gray-900">
+              Padrao Diario: Consumo vs Ocupacao
             </h3>
             <ResponsiveContainer width="100%" height={240}>
               <ComposedChart data={hourlyAverages}>
@@ -324,7 +306,6 @@ export default function BusinessDashboard() {
                 />
                 <XAxis
                   dataKey="hour"
-                  tickFormatter={(h) => `${h}h`}
                   label={{
                     value: "Hora do Dia",
                     position: "insideBottomLeft",
@@ -347,7 +328,7 @@ export default function BusinessDashboard() {
                   yAxisId="right"
                   orientation="right"
                   label={{
-                    value: "Ocupação (%)",
+                    value: "Ocupacao (%)",
                     angle: 90,
                     position: "insideRight",
                   }}
@@ -366,7 +347,7 @@ export default function BusinessDashboard() {
                   yAxisId="left"
                   type="monotone"
                   dataKey="avgEnergy"
-                  name="Consumo Médio (kW)"
+                  name="Consumo Medio (kW)"
                   stroke="#3b82f6"
                   strokeWidth={2}
                   dot={{ fill: "#3b82f6", r: 3 }}
@@ -375,65 +356,73 @@ export default function BusinessDashboard() {
                   yAxisId="right"
                   type="monotone"
                   dataKey="avgOccupancy"
-                  name="Ocupação Média (%)"
+                  name="Ocupacao Media (%)"
                   stroke="#f59e0b"
                   strokeWidth={2}
                   dot={{ fill: "#f59e0b", r: 3 }}
                 />
               </ComposedChart>
             </ResponsiveContainer>
-            <div className="mt-4 p-3 bg-gradient-to-r from-amber-50 to-orange-50 rounded-lg border border-amber-200">
+            <div className="mt-4 rounded-lg border border-amber-200 bg-gradient-to-r from-amber-50 to-orange-50 p-3">
               <p className="text-xs text-amber-800">
-                <strong>Insight:</strong> Pico de consumo entre
-                8h-18h correlaciona com maior ocupação do
-                frigorífico.
+                <strong>Insight:</strong> O padrao diario usa o
+                perfil horario real da API e uma ocupacao derivada
+                diretamente dessa curva.
               </p>
             </div>
           </div>
         </div>
 
-        {/* Insights Executivos */}
-        <div className="bg-gradient-to-br from-blue-50 to-indigo-50 rounded-lg border border-blue-200 p-4">
-          <h3 className="text-sm font-semibold text-gray-900 mb-3">
+        <div className="rounded-lg border border-blue-200 bg-gradient-to-br from-blue-50 to-indigo-50 p-4">
+          <h3 className="mb-3 text-sm font-semibold text-gray-900">
             Insights Executivos
           </h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="bg-white rounded-lg p-3 border border-blue-100">
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            <div className="rounded-lg border border-blue-100 bg-white p-3">
               <div className="flex items-start gap-2">
-                <div className="p-1.5 bg-green-100 rounded-lg">
+                <div className="rounded-lg bg-green-100 p-1.5">
                   <TrendingUp className="size-4 text-green-700" />
                 </div>
                 <div>
                   <p className="text-xs font-medium text-gray-900">
-                    Crescimento Sustentável
+                    Crescimento Sustentavel
                   </p>
-                  <p className="text-xs text-gray-600 mt-1">
-                    Faturamento cresceu{" "}
+                  <p className="mt-1 text-xs text-gray-600">
+                    A receita derivada cresceu{" "}
                     {revenueChange.toFixed(1)}% enquanto custo
-                    aumentou {energyCostChange.toFixed(1)}%.
+                    energetico variou {energyCostChange.toFixed(1)}
+                    %.
                   </p>
                 </div>
               </div>
             </div>
 
-            <div className="bg-white rounded-lg p-3 border border-blue-100">
+            <div className="rounded-lg border border-blue-100 bg-white p-3">
               <div className="flex items-start gap-2">
-                <div className="p-1.5 bg-purple-100 rounded-lg">
+                <div className="rounded-lg bg-purple-100 p-1.5">
                   <DollarSign className="size-4 text-purple-700" />
                 </div>
                 <div>
                   <p className="text-xs font-medium text-gray-900">
-                    Oportunidade
+                    Leitura de Negocio
                   </p>
-                  <p className="text-xs text-gray-600 mt-1">
-                    Otimização em horários de pico pode reduzir
-                    custos em até 15%.
+                  <p className="mt-1 text-xs text-gray-600">
+                    Todos os indicadores financeiros desta tela
+                    estao ancorados no consumo energetico real da
+                    API, com multiplicadores fixos para
+                    demonstracao.
                   </p>
                 </div>
               </div>
             </div>
           </div>
         </div>
+
+        <ApiRefreshNotice
+          isRefreshing={isRefreshing}
+          lastFetchedAt={lastFetchedAt}
+          visible={showRefreshNotice}
+        />
       </div>
     </DashboardLayout>
   );

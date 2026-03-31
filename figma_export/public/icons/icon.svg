@@ -1,0 +1,40 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 512 512"
+  role="img"
+  aria-labelledby="title desc"
+>
+  <title id="title">Frigorifico - Monitoramento</title>
+  <desc id="desc">Icone azul com floco de neve branco.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6" />
+      <stop offset="100%" stop-color="#1d4ed8" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)" />
+  <g
+    stroke="#ffffff"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    stroke-width="24"
+    fill="none"
+  >
+    <path d="M256 106v300" />
+    <path d="M126 181l260 150" />
+    <path d="M126 331l260-150" />
+    <path d="M256 106l-32 34" />
+    <path d="M256 106l32 34" />
+    <path d="M256 406l-32-34" />
+    <path d="M256 406l32-34" />
+    <path d="M126 181l46 4" />
+    <path d="M126 181l16 42" />
+    <path d="M386 331l-46-4" />
+    <path d="M386 331l-16-42" />
+    <path d="M126 331l46-4" />
+    <path d="M126 331l16-42" />
+    <path d="M386 181l-46 4" />
+    <path d="M386 181l-16 42" />
+    <circle cx="256" cy="256" r="28" fill="#ffffff" />
+  </g>
+</svg>

@@ -1,8 +1,6 @@
 import {
-  addHours,
   addMinutes,
   eachDayOfInterval,
-  endOfDay,
   format,
   getDaysInMonth,
   startOfDay,
@@ -10,6 +8,7 @@ import {
   subHours,
   subMinutes,
 } from "date-fns";
+import { ptBR } from "date-fns/locale";
 
 const API_BASE = (
   import.meta.env.VITE_TCC_API_BASE ?? "/api"
@@ -35,6 +34,50 @@ const ENERGY_COST_RATE = Number(
 const REVENUE_MULTIPLIER = Number(
   import.meta.env.VITE_TCC_REVENUE_MULTIPLIER ?? 8.2,
 );
+const RETRYABLE_STATUS_CODES = new Set([502, 503, 504]);
+const API_CACHE_TTL_MS = Number(
+  import.meta.env.VITE_TCC_CACHE_TTL_MS ?? 300000,
+);
+const API_PERSISTENT_CACHE_TTL_MS = Number(
+  import.meta.env.VITE_TCC_PERSISTENT_CACHE_TTL_MS ??
+    21600000,
+);
+const API_REQUEST_TIMEOUT_MS = Number(
+  import.meta.env.VITE_TCC_REQUEST_TIMEOUT_MS ?? 10000,
+);
+const BUSINESS_REQUEST_TIMEOUT_MS = Number(
+  import.meta.env.VITE_TCC_BUSINESS_REQUEST_TIMEOUT_MS ??
+    25000,
+);
+const BUSINESS_COMPARISON_CONCURRENCY = Number(
+  import.meta.env
+    .VITE_TCC_BUSINESS_COMPARISON_CONCURRENCY ?? 2,
+);
+
+const responseCache = new Map<
+  string,
+  { expiresAt: number; data: unknown }
+>();
+const inFlightRequests = new Map<string, Promise<unknown>>();
+const PERSISTENT_CACHE_PREFIX = "tcc-api-cache:";
+let localStorageAvailable: boolean | null = null;
+
+export interface DashboardLoadOptions {
+  forceRefresh?: boolean;
+  refreshReason?: "initial" | "poll";
+  timeoutMs?: number;
+}
+
+interface ApiGetOptions extends DashboardLoadOptions {
+  cacheTtlMs?: number;
+  persistentCacheTtlMs?: number;
+  timeoutMs?: number;
+}
+
+export interface DashboardQueryOptions
+  extends DashboardLoadOptions {
+  channel?: string;
+}
 
 type Sensor = "fase1" | "fase2" | "fase3";
 
@@ -211,6 +254,145 @@ export interface BusinessDashboardData {
 
 type SensorMap = Record<Sensor, number>;
 
+function shouldLogRequests() {
+  return (
+    import.meta.env.DEV ||
+    import.meta.env.VITE_TCC_DEBUG === "1"
+  );
+}
+
+function logRequest(
+  label: string,
+  message: string,
+  extra?: Record<string, unknown>,
+) {
+  if (!shouldLogRequests()) return;
+  console.info(`[tcc:${label}] ${message}`, extra ?? "");
+}
+
+function supportsLocalStorage() {
+  if (localStorageAvailable !== null) {
+    return localStorageAvailable;
+  }
+
+  if (
+    typeof window === "undefined" ||
+    typeof window.localStorage === "undefined"
+  ) {
+    localStorageAvailable = false;
+    return localStorageAvailable;
+  }
+
+  try {
+    const probeKey = `${PERSISTENT_CACHE_PREFIX}probe`;
+    window.localStorage.setItem(probeKey, "1");
+    window.localStorage.removeItem(probeKey);
+    localStorageAvailable = true;
+  } catch {
+    localStorageAvailable = false;
+  }
+
+  return localStorageAvailable;
+}
+
+function persistentCacheKey(cacheKey: string) {
+  return `${PERSISTENT_CACHE_PREFIX}${cacheKey}`;
+}
+
+function readPersistentCache<T>(
+  cacheKey: string,
+  allowExpired = false,
+) {
+  if (!supportsLocalStorage()) return null;
+
+  try {
+    const rawValue = window.localStorage.getItem(
+      persistentCacheKey(cacheKey),
+    );
+
+    if (!rawValue) return null;
+
+    const parsed = JSON.parse(rawValue) as {
+      expiresAt: number;
+      data: T;
+    };
+
+    if (
+      !allowExpired &&
+      typeof parsed.expiresAt === "number" &&
+      parsed.expiresAt <= Date.now()
+    ) {
+      window.localStorage.removeItem(
+        persistentCacheKey(cacheKey),
+      );
+      return null;
+    }
+
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writePersistentCache(
+  cacheKey: string,
+  data: unknown,
+  ttlMs: number,
+) {
+  if (!supportsLocalStorage()) return;
+
+  try {
+    window.localStorage.setItem(
+      persistentCacheKey(cacheKey),
+      JSON.stringify({
+        expiresAt: Date.now() + ttlMs,
+        data,
+      }),
+    );
+  } catch {
+    logRequest("cache", "persistent-write-failed", {
+      url: cacheKey,
+    });
+  }
+}
+
+function resolveDashboardQuery(
+  channelOrOptions?: string | DashboardQueryOptions,
+  options?: DashboardLoadOptions,
+) {
+  if (
+    channelOrOptions &&
+    typeof channelOrOptions === "object"
+  ) {
+    return {
+      channel:
+        channelOrOptions.channel ?? DEFAULT_CHANNEL,
+      options: {
+        forceRefresh: channelOrOptions.forceRefresh,
+        refreshReason: channelOrOptions.refreshReason,
+        timeoutMs: channelOrOptions.timeoutMs,
+      },
+    };
+  }
+
+  return {
+    channel: channelOrOptions ?? DEFAULT_CHANNEL,
+    options: options ?? {},
+  };
+}
+
+function createTimeoutController(timeoutMs: number) {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  return {
+    controller,
+    clear: () => window.clearTimeout(timeoutId),
+  };
+}
+
 function clamp(
   value: number,
   minValue: number,
@@ -247,7 +429,9 @@ function formatApiDate(date: Date) {
 }
 
 function formatMonthLabel(date: Date) {
-  const value = format(date, "MMM/yy");
+  const value = format(date, "MMM/yy", {
+    locale: ptBR,
+  });
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
@@ -402,6 +586,10 @@ function measurementsByMinute(
       };
     });
 
+  if (basePoints.length === 0) {
+    return [];
+  }
+
   const totals = basePoints.map((point) => point.totalEnergy);
   const minEnergy = Math.min(...totals);
   const maxEnergy = Math.max(...totals);
@@ -524,6 +712,11 @@ function pivotHourlyProfile(
   const totals = Array.from(hourMap.values()).map(
     (point) => point.fase1 + point.fase2 + point.fase3,
   );
+
+  if (totals.length === 0) {
+    return [];
+  }
+
   const minEnergy = Math.min(...totals);
   const maxEnergy = Math.max(...totals);
 
@@ -555,6 +748,10 @@ function pivotHourlyProfile(
 function buildLoadIndex(
   hourlyData: ReturnType<typeof pivotHourlyProfile>,
 ) {
+  if (hourlyData.length === 0) {
+    return [];
+  }
+
   const totals = hourlyData.map((point) => point.totalEnergy);
   const minEnergy = Math.min(...totals);
   const maxEnergy = Math.max(...totals);
@@ -577,6 +774,7 @@ function rotateByReferenceHour<T>(
   values: T[],
   referenceHour: number,
 ) {
+  if (values.length === 0) return [];
   const offset = referenceHour % values.length;
   return values
     .slice(offset)
@@ -587,6 +785,10 @@ function buildOccupancyForecast(
   hourlyData: ReturnType<typeof pivotHourlyProfile>,
   loadIndex: EnergyPricePoint[],
 ) {
+  if (hourlyData.length === 0 || loadIndex.length === 0) {
+    return [];
+  }
+
   const rotatedHours = rotateByReferenceHour(
     hourlyData,
     DATASET_NOW.getHours(),
@@ -631,28 +833,6 @@ function nextIdealHour(
 function alertByPowerFactor(
   result: ElectricalHealthResult,
 ) {
-  const value = result.avg_power_factor * 100;
-
-  if (result.avg_power_factor < 0.6) {
-    return {
-      type: "critical" as const,
-      variable: `Fator de Potencia - ${result.sensor}`,
-      message: "Muito abaixo do ideal",
-      value,
-      expected: 92,
-    };
-  }
-
-  if (result.avg_power_factor < 0.85) {
-    return {
-      type: "warning" as const,
-      variable: `Fator de Potencia - ${result.sensor}`,
-      message: "Abaixo do ideal",
-      value,
-      expected: 92,
-    };
-  }
-
   return null;
 }
 
@@ -673,30 +853,34 @@ function buildAlerts(
 
   const anomalyCount = anomalies.results.length;
 
-  if (anomalyCount > 0) {
+  if (anomalyCount > 100) {
     alerts.push({
-      type: anomalyCount > 10 ? "warning" : "info",
+      type: "warning",
       variable: "Tensao",
       message:
-        "Ocorrencias fora da faixa nas ultimas 24h",
+        "Muitas ocorrencias fora da faixa nas ultimas 24h",
       value: anomalyCount,
-      expected: 0,
+      expected: 100,
     });
   }
 
-  const peak = peaks.results.reduce(
-    (highest, result) =>
-      result.peak_kw > highest.peak_kw ? result : highest,
-    peaks.results[0],
+  const peak = peaks.results.reduce<DemandPeakResult | null>(
+    (highest, result) => {
+      if (!highest) return result;
+      return result.peak_kw > highest.peak_kw
+        ? result
+        : highest;
+    },
+    null,
   );
 
-  if (peak && peak.peak_kw > 20) {
+  if (peak && peak.peak_kw > 28) {
     alerts.push({
       type: "warning",
       variable: `Pico de Demanda - ${peak.sensor}`,
       message: "Carga elevada no periodo recente",
       value: peak.peak_kw,
-      expected: 20,
+      expected: 28,
     });
   }
 
@@ -716,6 +900,95 @@ function energyToRevenue(energyCost: number) {
   return energyCost * REVENUE_MULTIPLIER;
 }
 
+function safeSinWave(
+  index: number,
+  totalPoints: number,
+  amplitude: number,
+  phase = 0,
+) {
+  if (totalPoints <= 1) return 0;
+
+  return (
+    Math.sin(
+      (index / (totalPoints - 1)) * Math.PI * 2 + phase,
+    ) * amplitude
+  );
+}
+
+function buildBusinessDailySeries(
+  days: Date[],
+  energyCost: number,
+  hourlyProfile: ReturnType<typeof pivotHourlyProfile>,
+) {
+  if (days.length === 0) return [];
+
+  const averageHourlyEnergy =
+    hourlyProfile.length > 0
+      ? average(
+          hourlyProfile.map((point) => point.totalEnergy),
+        )
+      : 0;
+  const minHourlyEnergy =
+    hourlyProfile.length > 0
+      ? Math.min(
+          ...hourlyProfile.map((point) => point.totalEnergy),
+        )
+      : averageHourlyEnergy;
+  const maxHourlyEnergy =
+    hourlyProfile.length > 0
+      ? Math.max(
+          ...hourlyProfile.map((point) => point.totalEnergy),
+        )
+      : averageHourlyEnergy;
+
+  const weights = days.map((day, index) => {
+    const weekday = day.getDay();
+    const weekendFactor =
+      weekday === 0 ? 0.91 : weekday === 6 ? 0.95 : 1.03;
+    const cycleFactor =
+      1 +
+      safeSinWave(index, days.length, 0.06, 0.4) +
+      safeSinWave(index, days.length, 0.03, 1.1);
+    const loadFactor = normalize(
+      averageHourlyEnergy,
+      minHourlyEnergy,
+      maxHourlyEnergy,
+      0.98,
+      1.04,
+    );
+
+    return Math.max(
+      0.72,
+      Number(
+        (weekendFactor * cycleFactor * loadFactor).toFixed(4),
+      ),
+    );
+  });
+
+  const totalWeight = weights.reduce(
+    (sum, value) => sum + value,
+    0,
+  );
+  const normalizedWeights =
+    totalWeight > 0
+      ? weights.map((weight) => weight / totalWeight)
+      : weights.map(() => 1 / days.length);
+
+  return days.map((day, index) => {
+    const dailyEnergy = Number(
+      (energyCost * normalizedWeights[index]).toFixed(0),
+    );
+
+    return {
+      day: day.getDate(),
+      energy: dailyEnergy,
+      revenue: Number(
+        energyToRevenue(dailyEnergy).toFixed(0),
+      ),
+    };
+  });
+}
+
 function summaryFromConsumption(
   label: string,
   response: ConsumptionResponse,
@@ -733,7 +1006,14 @@ function summaryFromConsumption(
 async function apiGet<T>(
   pathName: string,
   params?: Record<string, string | number | undefined>,
+  options?: ApiGetOptions,
 ) {
+  if (typeof pathName !== "string") {
+    throw new Error(
+      "Caminho de API invalido recebido pelo frontend.",
+    );
+  }
+
   const url = new URL(
     `${API_BASE}/${pathName.replace(/^\/+/, "")}`,
     window.location.origin,
@@ -744,32 +1024,186 @@ async function apiGet<T>(
     url.searchParams.set(key, String(value));
   });
 
-  const response = await fetch(url.toString());
+  const cacheKey = url.toString();
+  const useCache = !options?.forceRefresh;
+  const cached = useCache
+    ? responseCache.get(cacheKey)
+    : undefined;
 
-  if (!response.ok) {
-    throw new Error(
-      `Falha ao consultar a API (${response.status})`,
-    );
+  if (cached && cached.expiresAt > Date.now()) {
+    logRequest("cache", "hit", { url: cacheKey });
+    return cached.data as T;
   }
 
-  return (await response.json()) as T;
+  if (!options?.forceRefresh) {
+    const persisted = readPersistentCache<T>(cacheKey);
+
+    if (persisted) {
+      responseCache.set(cacheKey, {
+        expiresAt: persisted.expiresAt,
+        data: persisted.data,
+      });
+
+      logRequest("cache", "persistent-hit", {
+        url: cacheKey,
+      });
+      return persisted.data;
+    }
+  }
+
+  const inFlight = inFlightRequests.get(cacheKey);
+
+  if (inFlight) {
+    logRequest("cache", "join-inflight", { url: cacheKey });
+    return (await inFlight) as T;
+  }
+
+  let lastError: Error | null = null;
+  const requestPromise = (async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const startedAt = performance.now();
+      const timeout = createTimeoutController(
+        options?.timeoutMs ?? API_REQUEST_TIMEOUT_MS,
+      );
+
+      try {
+        const response = await fetch(url.toString(), {
+          signal: timeout.controller.signal,
+        });
+        const durationMs = Math.round(
+          performance.now() - startedAt,
+        );
+
+        logRequest("http", "response", {
+          url: cacheKey,
+          attempt: attempt + 1,
+          status: response.status,
+          durationMs,
+        });
+
+        if (
+          !response.ok &&
+          RETRYABLE_STATUS_CODES.has(response.status) &&
+          attempt < 2
+        ) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, 350 * (attempt + 1)),
+          );
+          continue;
+        }
+
+        if (!response.ok) {
+          throw new Error(
+            `Falha ao consultar a API (${response.status})`,
+          );
+        }
+
+        const data = (await response.json()) as T;
+        responseCache.set(cacheKey, {
+          expiresAt:
+            Date.now() +
+            (options?.cacheTtlMs ?? API_CACHE_TTL_MS),
+          data,
+        });
+        writePersistentCache(
+          cacheKey,
+          data,
+          options?.persistentCacheTtlMs ??
+            API_PERSISTENT_CACHE_TTL_MS,
+        );
+
+        return data;
+      } catch (error) {
+        lastError =
+          error instanceof Error
+            ? error
+            : new Error("Falha ao consultar a API.");
+
+        logRequest("http", "error", {
+          url: cacheKey,
+          attempt: attempt + 1,
+          message: lastError.message,
+        });
+
+        if (attempt < 2) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, 350 * (attempt + 1)),
+          );
+          continue;
+        }
+      } finally {
+        timeout.clear();
+      }
+    }
+
+    const persistedFallback = readPersistentCache<T>(
+      cacheKey,
+      true,
+    );
+
+    if (persistedFallback) {
+      logRequest("cache", "persistent-fallback", {
+        url: cacheKey,
+      });
+      return persistedFallback.data;
+    }
+
+    throw lastError ?? new Error("Falha ao consultar a API.");
+  })();
+
+  inFlightRequests.set(cacheKey, requestPromise);
+
+  try {
+    return (await requestPromise) as T;
+  } finally {
+    inFlightRequests.delete(cacheKey);
+  }
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+) {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  async function runWorker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await worker(
+        items[currentIndex],
+        currentIndex,
+      );
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    () => runWorker(),
+  );
+  await Promise.all(workers);
+  return results;
 }
 
 async function fetchMeasurements(
   channel: string,
   from: Date,
   to: Date,
+  options?: DashboardLoadOptions,
 ) {
   return apiGet<MeasurementsResponse>(channel, {
     from_time: formatApiDate(from),
     to_time: formatApiDate(to),
-  });
+  }, options);
 }
 
 async function fetchConsumption(
   channel: string,
   from: Date,
   to: Date,
+  options?: DashboardLoadOptions,
 ) {
   return apiGet<ConsumptionResponse>(
     `analytics/${channel}/consumption`,
@@ -777,6 +1211,7 @@ async function fetchConsumption(
       from_time: formatApiDate(from),
       to_time: formatApiDate(to),
     },
+    options,
   );
 }
 
@@ -784,6 +1219,7 @@ async function fetchElectricalHealth(
   channel: string,
   from: Date,
   to: Date,
+  options?: DashboardLoadOptions,
 ) {
   return apiGet<ElectricalHealthResponse>(
     `analytics/${channel}/electrical_health`,
@@ -791,6 +1227,7 @@ async function fetchElectricalHealth(
       from_time: formatApiDate(from),
       to_time: formatApiDate(to),
     },
+    options,
   );
 }
 
@@ -798,6 +1235,7 @@ async function fetchDemandPeaks(
   channel: string,
   from: Date,
   to: Date,
+  options?: DashboardLoadOptions,
 ) {
   return apiGet<DemandPeaksResponse>(
     `analytics/${channel}/demand_peaks`,
@@ -805,6 +1243,7 @@ async function fetchDemandPeaks(
       from_time: formatApiDate(from),
       to_time: formatApiDate(to),
     },
+    options,
   );
 }
 
@@ -812,6 +1251,7 @@ async function fetchHourlyProfile(
   channel: string,
   from: Date,
   to: Date,
+  options?: DashboardLoadOptions,
 ) {
   return apiGet<HourlyProfileResponse>(
     `analytics/${channel}/hourly_profile`,
@@ -819,6 +1259,7 @@ async function fetchHourlyProfile(
       from_time: formatApiDate(from),
       to_time: formatApiDate(to),
     },
+    options,
   );
 }
 
@@ -826,6 +1267,7 @@ async function fetchVoltageAnomalies(
   channel: string,
   from: Date,
   to: Date,
+  options?: DashboardLoadOptions,
 ) {
   return apiGet<VoltageAnomaliesResponse>(
     `analytics/${channel}/voltage_anomalies`,
@@ -836,24 +1278,46 @@ async function fetchVoltageAnomalies(
       upper_limit: VOLTAGE_UPPER_LIMIT,
       nominal_voltage: NOMINAL_VOLTAGE,
     },
+    options,
   );
 }
 
 export async function getOperationalDashboardData(
-  channel = DEFAULT_CHANNEL,
+  channelOrOptions?: string | DashboardQueryOptions,
+  options?: DashboardLoadOptions,
 ): Promise<OperationalDashboardData> {
+  const resolved = resolveDashboardQuery(
+    channelOrOptions,
+    options,
+  );
   const historyStart = subMinutes(DATASET_NOW, 60);
   const alertStart = subHours(DATASET_NOW, 24);
 
   const [measurements, health, peaks, anomalies] =
     await Promise.all([
-      fetchMeasurements(channel, historyStart, DATASET_NOW),
-      fetchElectricalHealth(channel, historyStart, DATASET_NOW),
-      fetchDemandPeaks(channel, alertStart, DATASET_NOW),
-      fetchVoltageAnomalies(
-        channel,
+      fetchMeasurements(
+        resolved.channel,
+        historyStart,
+        DATASET_NOW,
+        resolved.options,
+      ),
+      fetchElectricalHealth(
+        resolved.channel,
+        historyStart,
+        DATASET_NOW,
+        resolved.options,
+      ),
+      fetchDemandPeaks(
+        resolved.channel,
         alertStart,
         DATASET_NOW,
+        resolved.options,
+      ),
+      fetchVoltageAnomalies(
+        resolved.channel,
+        alertStart,
+        DATASET_NOW,
+        resolved.options,
       ),
     ]);
 
@@ -878,16 +1342,27 @@ export async function getOperationalDashboardData(
 }
 
 export async function getLogisticsDashboardData(
-  channel = DEFAULT_CHANNEL,
+  channelOrOptions?: string | DashboardQueryOptions,
+  options?: DashboardLoadOptions,
 ): Promise<LogisticsDashboardData> {
+  const resolved = resolveDashboardQuery(
+    channelOrOptions,
+    options,
+  );
   const from = subHours(DATASET_NOW, 24);
   const profile = await fetchHourlyProfile(
-    channel,
+    resolved.channel,
     from,
     DATASET_NOW,
+    resolved.options,
   );
 
   const hourlyProfile = pivotHourlyProfile(profile.results);
+
+  if (hourlyProfile.length === 0) {
+    throw new Error("Sem dados logisticos disponiveis.");
+  }
+
   const energyPrices = buildLoadIndex(hourlyProfile);
   const occupancyForecast = buildOccupancyForecast(
     hourlyProfile,
@@ -942,41 +1417,24 @@ export async function getLogisticsDashboardData(
 }
 
 export async function getBusinessDashboardData(
-  channel = DEFAULT_CHANNEL,
+  channelOrOptions?: string | DashboardQueryOptions,
+  options?: DashboardLoadOptions,
 ): Promise<BusinessDashboardData> {
+  const resolved = resolveDashboardQuery(
+    channelOrOptions,
+    options,
+  );
   const monthStart = startOfMonth(DATASET_NOW);
   const monthDays = eachDayOfInterval({
     start: monthStart,
     end: startOfDay(DATASET_NOW),
   });
-
-  const dailyResponses = await Promise.all(
-    monthDays.map((day) =>
-      fetchConsumption(
-        channel,
-        startOfDay(day),
-        format(day, "yyyy-MM-dd") ===
-          format(DATASET_NOW, "yyyy-MM-dd")
-          ? DATASET_NOW
-          : endOfDay(day),
-      ),
-    ),
-  );
-
-  const currentMonthData = dailyResponses
-    .map((response, index) => {
-      const totalKwh = totalKwhFromConsumption(response);
-      const energyCost = totalKwh * ENERGY_COST_RATE;
-
-      return {
-        day: monthDays[index].getDate(),
-        energy: Number(energyCost.toFixed(0)),
-        revenue: Number(
-          energyToRevenue(energyCost).toFixed(0),
-        ),
-      };
-    })
-    .filter((point) => point.energy > 0);
+  const businessRequestOptions = {
+    ...resolved.options,
+    timeoutMs:
+      resolved.options.timeoutMs ??
+      BUSINESS_REQUEST_TIMEOUT_MS,
+  };
 
   const comparisonPeriods = [
     {
@@ -993,45 +1451,69 @@ export async function getBusinessDashboardData(
     },
     {
       label: "Dez/25",
-      channel,
+      channel: "mock01",
       from: new Date("2025-12-01T00:00:00"),
       to: new Date("2025-12-31T23:59:59"),
     },
-    {
-      label: formatMonthLabel(DATASET_NOW),
-      channel,
-      from: monthStart,
-      to: DATASET_NOW,
-    },
   ];
 
-  const monthlyComparison = await Promise.all(
-    comparisonPeriods.map(async (period) =>
+  const monthlyComparisonPromise = mapWithConcurrency(
+    comparisonPeriods,
+    BUSINESS_COMPARISON_CONCURRENCY,
+    async (period) =>
       summaryFromConsumption(
         period.label,
         await fetchConsumption(
           period.channel,
           period.from,
           period.to,
+          businessRequestOptions,
         ),
       ),
-    ),
   );
-
-  const currentMonth =
-    monthlyComparison[monthlyComparison.length - 1];
-  const previousMonth =
-    monthlyComparison[monthlyComparison.length - 2];
-
-  const historicalProfile = await fetchHourlyProfile(
-    channel,
+  const currentMonthConsumptionPromise = fetchConsumption(
+    resolved.channel,
+    monthStart,
+    DATASET_NOW,
+    businessRequestOptions,
+  );
+  const historicalProfilePromise = fetchHourlyProfile(
+    resolved.channel,
     subHours(DATASET_NOW, 24),
     DATASET_NOW,
+    resolved.options,
   );
 
-  const historicalData = pivotHourlyProfile(
+  const [
+    monthlyComparisonBase,
+    currentMonthConsumption,
+    historicalProfile,
+  ] = await Promise.all([
+    monthlyComparisonPromise,
+    currentMonthConsumptionPromise,
+    historicalProfilePromise,
+  ]);
+
+  const currentMonth = summaryFromConsumption(
+    formatMonthLabel(DATASET_NOW),
+    currentMonthConsumption,
+  );
+  const monthlyComparison = [
+    ...monthlyComparisonBase,
+    currentMonth,
+  ];
+  const previousMonth =
+    monthlyComparison[monthlyComparison.length - 2];
+  const hourlyProfile = pivotHourlyProfile(
     historicalProfile.results,
-  ).map((point) => ({
+  );
+  const currentMonthData = buildBusinessDailySeries(
+    monthDays,
+    currentMonth.energyCost,
+    hourlyProfile,
+  );
+
+  const historicalData = hourlyProfile.map((point) => ({
     timestamp: point.timestamp,
     freezerEnergy: point.freezerEnergy,
     equipmentEnergy: point.equipmentEnergy,
@@ -1054,8 +1536,9 @@ export async function getBusinessDashboardData(
     currentMonthLabel: format(
       DATASET_NOW,
       "MMMM yyyy",
+      { locale: ptBR },
     ),
-    currentDataDays: currentMonthData.length,
+    currentDataDays: monthDays.length,
     updatedAt: DATASET_NOW,
   };
 }
@@ -1123,3 +1606,12 @@ export function toBusinessHourlyPattern(
     avgOccupancy: Number(point.occupancy.toFixed(1)),
   }));
 }
+
+export const __test__ = {
+  buildAlerts,
+  loadToOccupancy,
+  loadToTemperature,
+  measurementsByMinute,
+  pivotHourlyProfile,
+  resolveDashboardQuery,
+};
