@@ -1,0 +1,11 @@
+backup_*.db
+sample_backup_chunk.bin
+*.sqlite
+*.db
+.DS_Store
+Thumbs.db
+node_modules/
+dist/
+build/
+.env
+.env.local
