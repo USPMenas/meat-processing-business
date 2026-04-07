@@ -1438,12 +1438,6 @@ export async function getBusinessDashboardData(
 
   const comparisonPeriods = [
     {
-      label: "Out/25",
-      channel: "mock01",
-      from: new Date("2025-10-01T00:00:00"),
-      to: new Date("2025-10-31T23:59:59"),
-    },
-    {
       label: "Nov/25",
       channel: "mock01",
       from: new Date("2025-11-01T00:00:00"),

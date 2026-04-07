@@ -214,21 +214,6 @@ export default function BusinessDashboard() {
                 </div>
               }
             />
-
-            <MetricCardWithChart
-              title="Margem Operacional"
-              value={currentMargin.toFixed(1)}
-              unit="%"
-              icon={Target}
-              variant="business"
-              subtitle="Margem atual"
-              footer={
-                <div className="text-xs text-blue-700">
-                  <strong>Projecao:</strong>{" "}
-                  {projectedMargin.toFixed(1)}% no fim do mes
-                </div>
-              }
-            />
           </div>
         </div>
 
