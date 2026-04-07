@@ -53,17 +53,12 @@ export default function OperationalDashboard() {
   const {
     currentData,
     historicalData,
-    predictionData,
     alerts,
   } = dashboardData;
   const combinedData = [
     ...historicalData.map((point) => ({
       ...point,
       type: "historico",
-    })),
-    ...predictionData.map((point) => ({
-      ...point,
-      type: "previsao",
     })),
   ];
   const recentData = historicalData.slice(-12);

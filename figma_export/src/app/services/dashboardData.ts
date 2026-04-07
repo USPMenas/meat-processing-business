@@ -194,7 +194,6 @@ export interface OperationalPoint {
 export interface OperationalDashboardData {
   currentData: OperationalPoint;
   historicalData: OperationalPoint[];
-  predictionData: OperationalPoint[];
   alerts: Alert[];
   updatedAt: Date;
 }
@@ -1324,7 +1323,6 @@ export async function getOperationalDashboardData(
   const historicalData = measurementsByMinute(
     measurements.measurements,
   );
-  const predictionData = buildForecast(historicalData);
   const currentData =
     historicalData[historicalData.length - 1];
 
@@ -1335,7 +1333,6 @@ export async function getOperationalDashboardData(
   return {
     currentData,
     historicalData,
-    predictionData,
     alerts: buildAlerts(health, peaks, anomalies),
     updatedAt: DATASET_NOW,
   };
